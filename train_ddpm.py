@@ -30,7 +30,6 @@ def train_ddpm(dip_model_path, output_path, data_path, num_steps=1000, lr=0.001,
             loss.backward()
             optimizer.step()
 
-            # 清理缓存
             torch.cuda.empty_cache()
 
         if step % 100 == 0:
