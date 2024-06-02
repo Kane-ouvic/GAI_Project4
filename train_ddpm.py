@@ -1,48 +1,64 @@
-import argparse
 import torch
+import torch.optim as optim
 from models.ddpm import DDPM
-from models.dip import DIP
-from utils.data_loader import get_cifar10_dataloader
+from utils.data_loader import load_image
+import argparse
+from torchvision.transforms import Resize
+import matplotlib.pyplot as plt
+import numpy as np
+import os
 
-def train_ddpm(dip_model_path, output_path, data_path, num_steps=1000, lr=0.001, data_limit=500):
+def train_ddpm(image_path, num_epochs=10000, target_size=(32, 32)): 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dataloader = get_cifar10_dataloader(data_path=data_path, train=True, batch_size=16, limit=data_limit)
+    img = load_image(image_path).to(device)
+    img = Resize(target_size)(img)
 
-    dip_model = DIP().to(device)
-    dip_model.load_state_dict(torch.load(dip_model_path))
+    # Load the DIP model's output as the initial prior for DDPM
+    initial_prior = torch.load('dip_output.pt').to(device)
 
-    ddpm = DDPM().to(device)
+    # Initialize and train DDPM model
+    ddpm_model = DDPM(initial_prior=initial_prior, device=device).to(device)
+    ddpm_optimizer = optim.Adam(ddpm_model.parameters(), lr=0.0001) 
 
-    optimizer = torch.optim.Adam(ddpm.parameters(), lr=lr)
-    criterion = torch.nn.MSELoss()
+    losses = []
+    output_dir = 'ddpm_output_images'
+    os.makedirs(output_dir, exist_ok=True)
 
-    for step in range(num_steps):
-        for batch in dataloader:
-            images, _ = batch
-            images = images.to(device)
-            initial_prior = dip_model(images).detach()
+    for epoch in range(num_epochs):
+        ddpm_optimizer.zero_grad()
+        loss = ddpm_model(img)
+        loss.backward()
+        ddpm_optimizer.step()
 
-            ddpm.initialize_with_prior(initial_prior)
+        losses.append(loss.item())
 
-            optimizer.zero_grad()
-            output = ddpm.step()
-            loss = criterion(output, images)
-            loss.backward()
-            optimizer.step()
+        if epoch % 100 == 0:
+            print(f"DDPM Epoch [{epoch}/{num_epochs}], Loss: {loss.item():.4f}")
 
+        if epoch % 1000 == 0:
+            # Generate sample from DDPM
+            sample = torch.randn(1, 3, *target_size, device=device)
+            generated_img = ddpm_model.generate(sample)
+            generated_img = generated_img.detach().cpu().squeeze().permute(1, 2, 0).numpy()
+            generated_img = np.clip(generated_img, 0, 1)  # Clamp values to [0, 1] range
+            plt.imshow(generated_img)
+            plt.show()
             torch.cuda.empty_cache()
 
-        if step % 100 == 0:
-            print(f"Step {step}, Loss: {loss.item()}")
+            # Save generated image
+            plt.imsave(f'{output_dir}/ddpm_output_epoch_{epoch}.png', generated_img)
 
-    torch.save(ddpm.state_dict(), output_path)
-    print(f"DDPM model saved to {output_path}")
+    # Plot the loss curve
+    plt.figure()
+    plt.plot(losses)
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('DDPM Training Loss Curve')
+    plt.savefig('ddpm_loss_curve.png')
+    plt.show()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train DDPM model with DIP prior")
-    parser.add_argument("--dip_model_path", type=str, required=True, help="Path to the DIP model")
-    parser.add_argument("--output_path", type=str, required=True, help="Path to save the DDPM model")
-    parser.add_argument("--data_path", type=str, required=True, help="Path to CIFAR-10 dataset")
+    parser = argparse.ArgumentParser(description='Train DDPM model')
+    parser.add_argument('--image_path', type=str, required=True, help='Path to the input image')
     args = parser.parse_args()
-
-    train_ddpm(args.dip_model_path, args.output_path, args.data_path)
+    train_ddpm(args.image_path)

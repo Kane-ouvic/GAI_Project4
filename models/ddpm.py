@@ -1,56 +1,64 @@
 import torch
 import torch.nn as nn
-
-class ResidualBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, stride=1):
-        super(ResidualBlock, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1)
-        self.bn1 = nn.BatchNorm2d(out_channels)
-        self.relu = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
-        self.bn2 = nn.BatchNorm2d(out_channels)
-
-        self.skip = nn.Sequential()
-        if stride != 1 or in_channels != out_channels:
-            self.skip = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride),
-                nn.BatchNorm2d(out_channels)
-            )
-
-    def forward(self, x):
-        out = self.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out += self.skip(x)
-        out = self.relu(out)
-        return out
+import torch.nn.functional as F
 
 class DDPM(nn.Module):
-    def __init__(self, num_blocks=3):
+    def __init__(self, initial_prior=None, image_size=64, channels=3, timesteps=1000, device=None):
         super(DDPM, self).__init__()
-        self.diffusion_steps = 1000
-        self.input_layer = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1)
-        self.residual_blocks = self._make_layer(ResidualBlock, 64, 128, num_blocks)
-        self.output_layer = nn.Conv2d(128, 3, kernel_size=3, stride=1, padding=1)
-        self.relu = nn.ReLU(inplace=True)
+        self.initial_prior = initial_prior
+        self.image_size = image_size
+        self.channels = channels
+        self.timesteps = timesteps
+        self.device = device
 
-    def _make_layer(self, block, in_channels, out_channels, num_blocks):
-        layers = []
-        for _ in range(num_blocks):
-            layers.append(block(in_channels, out_channels))
-        return nn.Sequential(*layers)
+        self.beta = torch.linspace(0.0001, 0.02, timesteps).to(self.device)
+        self.alpha = 1.0 - self.beta
+        self.alpha_cumprod = torch.cumprod(self.alpha, 0).to(self.device)
+        self.alpha_cumprod_prev = F.pad(self.alpha_cumprod[:-1], (1, 0), value=1.0).to(self.device)
+        
+        self.net = nn.Sequential(
+            nn.Conv2d(channels, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(256, 128, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(128, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, channels, kernel_size=3, padding=1)
+        ).to(self.device)
 
-    def initialize_with_prior(self, prior):
-        self.prior = prior
+    def q_sample(self, x_start, t, noise=None):
+        if noise is None:
+            noise = torch.randn_like(x_start).to(self.device)
+        return (self.alpha_cumprod[t] ** 0.5) * x_start + ((1 - self.alpha_cumprod[t]) ** 0.5) * noise
 
-    def step(self):
-        noise = torch.randn_like(self.prior)
-        out = self.input_layer(self.prior + noise)
-        out = self.residual_blocks(out)
-        out = self.output_layer(out)
-        return self.relu(out)
+    def p_losses(self, x_start, t, noise=None):
+        if noise is None:
+            noise = torch.randn_like(x_start).to(self.device)
+        
+        x_noisy = self.q_sample(x_start, t, noise)
+        predicted_noise = self.net(x_noisy)
+        return F.mse_loss(predicted_noise, noise)
 
-    def generate(self, shape):
-        generated_image = torch.randn(shape).to(self.prior.device)
-        for _ in range(self.diffusion_steps):
-            generated_image = self.step()
-        return generated_image
+    def forward(self, x_start):
+        t = torch.randint(0, self.timesteps, (x_start.size(0),), device=self.device).long()
+        return self.p_losses(x_start, t)
+    
+    def generate(self, sample):
+        for i in reversed(range(self.timesteps)):
+            t = torch.full((sample.size(0),), i, device=self.device, dtype=torch.long)
+            predicted_noise = self.net(sample)
+            alpha = self.alpha[t][:, None, None, None]
+            alpha_cumprod = self.alpha_cumprod[t][:, None, None, None]
+            beta = self.beta[t][:, None, None, None]
+
+            sample = (sample - (1 - alpha) / (1 - alpha_cumprod) ** 0.5 * predicted_noise) / alpha ** 0.5
+
+            if i > 0:
+                noise = torch.randn_like(sample)
+                sample += beta ** 0.5 * noise
+        
+        return sample
